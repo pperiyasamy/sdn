@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -19,6 +20,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
 	kruntimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	"k8s.io/klog/v2"
 	kcontainer "k8s.io/kubernetes/pkg/kubelet/container"
@@ -68,6 +70,7 @@ type podManager struct {
 	// and thus can be set from Start()
 	ipamConfig   []byte
 	reattachPods map[string]*corev1.Pod
+	podMutex     map[string]*sync.Mutex
 }
 
 // Creates a new live podManager; used by node code0
@@ -79,6 +82,7 @@ func newPodManager(kClient kubernetes.Interface, policy osdnPolicy, overlayMTU u
 	pm.routableMTU = routableMTU
 	pm.podHandler = pm
 	pm.ovs = ovs
+	pm.podMutex = make(map[string]*sync.Mutex)
 	return pm
 }
 
@@ -88,6 +92,7 @@ func newDefaultPodManager() *podManager {
 		runningPods:  make(map[string]*runningPod),
 		requests:     make(chan *cniserver.PodRequest, 20),
 		reattachPods: make(map[string]*corev1.Pod),
+		podMutex:     make(map[string]*sync.Mutex),
 	}
 }
 
@@ -263,22 +268,36 @@ func (m *podManager) UpdateLocalMulticastRules(vnid uint32) {
 	m.updateLocalMulticastRulesWithLock(vnid)
 }
 
-// Process all CNI requests from the request queue serially.  Our OVS interaction
-// and scripts currently cannot run in parallel, and doing so greatly complicates
-// setup/teardown logic
+// Process all CNI requests from the request queue in parallel using go routine.
+// Our OVS interaction and scripts currently cannot run in parallel, and doing
+// so greatly complicates setup/teardown logic, so serialize the events using
+// mutext at a pod level.
 func (m *podManager) processCNIRequests() {
 	for request := range m.requests {
-		result := m.processRequest(request)
-		request.Result <- result
+		req := request
+		go func() {
+			var result *cniserver.PodResult
+			retry.OnError(retry.DefaultBackoff, func(err error) bool {
+				return err.Error() == "pod mutex not found"
+			}, func() error {
+				result = m.processRequest(req)
+				return result.Err
+			})
+			req.Result <- result
+		}()
 	}
 	panic("stopped processing CNI pod requests!")
 }
 
 func (m *podManager) processRequest(request *cniserver.PodRequest) *cniserver.PodResult {
+
 	pk := getPodKey(request.PodNamespace, request.PodName)
 	result := &cniserver.PodResult{}
 	switch request.Command {
 	case cniserver.CNI_ADD:
+		podMutex := m.podLockPutIfAbsent(pk)
+		podMutex.Lock()
+		defer podMutex.Unlock()
 		ipamResult, runningPod, err := m.podHandler.setup(request)
 		if ipamResult != nil {
 			result.Response, err = json.Marshal(ipamResult)
@@ -297,6 +316,9 @@ func (m *podManager) processRequest(request *cniserver.PodRequest) *cniserver.Po
 			result.Err = err
 		}
 	case cniserver.CNI_UPDATE:
+		podMutex := m.podLockPutIfAbsent(pk)
+		podMutex.Lock()
+		defer podMutex.Unlock()
 		vnid, err := m.podHandler.update(request)
 		if err == nil {
 			m.runningPodsLock.Lock()
@@ -309,6 +331,17 @@ func (m *podManager) processRequest(request *cniserver.PodRequest) *cniserver.Po
 		}
 		result.Err = err
 	case cniserver.CNI_DEL:
+		podMutex, err := m.getPodLock(pk)
+		if err != nil {
+			klog.Warningf("CNI_DEL %s failed: %v", pk, err)
+			result.Err = err
+			return result
+		}
+		podMutex.Lock()
+		defer func() {
+			podMutex.Unlock()
+			m.removePodLock(pk)
+		}()
 		m.runningPodsLock.Lock()
 		if runningPod, exists := m.runningPods[pk]; exists {
 			delete(m.runningPods, pk)
@@ -326,6 +359,33 @@ func (m *podManager) processRequest(request *cniserver.PodRequest) *cniserver.Po
 		result.Err = fmt.Errorf("unhandled CNI request %v", request.Command)
 	}
 	return result
+}
+
+func (m *podManager) podLockPutIfAbsent(podKey string) *sync.Mutex {
+	m.runningPodsLock.Lock()
+	defer m.runningPodsLock.Unlock()
+	var podMutex *sync.Mutex
+	var ok bool
+	if podMutex, ok = m.podMutex[podKey]; !ok {
+		podMutex = &sync.Mutex{}
+		m.podMutex[podKey] = podMutex
+	}
+	return podMutex
+}
+
+func (m *podManager) getPodLock(podKey string) (*sync.Mutex, error) {
+	m.runningPodsLock.Lock()
+	defer m.runningPodsLock.Unlock()
+	if podMutex, ok := m.podMutex[podKey]; ok {
+		return podMutex, nil
+	}
+	return nil, errors.New("pod mutex not found")
+}
+
+func (m *podManager) removePodLock(podKey string) {
+	m.runningPodsLock.Lock()
+	defer m.runningPodsLock.Unlock()
+	delete(m.podMutex, podKey)
 }
 
 // Adds a macvlan interface to a container, if requested, for use with the egress router feature
